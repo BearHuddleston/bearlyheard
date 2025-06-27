@@ -8,8 +8,8 @@ import logging
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
 
-from gui import MainWindow, ThemeManager
-from utils import setup_logger, Config
+from .gui import MainWindow, ThemeManager
+from .utils import setup_logger, Config
 
 
 def main():
