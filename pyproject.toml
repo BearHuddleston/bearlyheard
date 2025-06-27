@@ -1,0 +1,53 @@
+[project]
+name = "bearlyheard"
+version = "0.1.0"
+description = "AI-powered meeting recorder with transcription and summarization"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pyqt6>=6.6.0",
+    "pyqtdarktheme>=2.1.0",
+    "pyaudiowpatch>=0.2.12.5",
+    "sounddevice>=0.4.6",
+    "numpy>=1.24.0",
+    "openai-whisper>=20231117",
+    "llama-cpp-python>=0.2.0",
+    "pyannote.audio>=3.1.0",
+    "pydub>=0.25.1",
+    "python-docx>=1.1.0",
+    "reportlab>=4.0.0",
+    "scipy>=1.10.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/bearlyheard"
+Issues = "https://github.com/yourusername/bearlyheard/issues"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=7.4.0",
+    "pytest-qt>=4.2.0",
+    "pytest-cov>=4.1.0",
+    "pyinstaller>=6.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "W", "I", "N", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
