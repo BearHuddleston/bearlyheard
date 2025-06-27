@@ -10,10 +10,19 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread
 from PyQt6.QtGui import QAction, QFont, QIcon
 
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    np = None
+    HAS_NUMPY = False
+
 from ..utils.logger import LoggerMixin
 from ..utils.config import Config
 from ..utils.file_manager import FileManager
 from ..audio.devices import AudioDeviceManager, AudioDevice
+from ..audio.capture import AudioCapture, AudioLevel
+from ..audio.player import AudioPlayer
 from .themes import ThemeManager
 
 
@@ -31,6 +40,8 @@ class MainWindow(QMainWindow, LoggerMixin):
         self.config = Config()
         self.file_manager = FileManager()
         self.audio_device_manager = AudioDeviceManager()
+        self.audio_capture = AudioCapture()
+        self.audio_player = AudioPlayer()
         self.theme_manager = ThemeManager()
         
         # State variables
@@ -41,6 +52,9 @@ class MainWindow(QMainWindow, LoggerMixin):
         # Timer for updating recording duration
         self.timer = QTimer()
         self.timer.timeout.connect(self._update_timer)
+        
+        # Setup audio level monitoring
+        self.audio_capture.add_level_callback(self._on_audio_level_update)
         
         # Setup UI
         self._setup_ui()
@@ -335,6 +349,17 @@ class MainWindow(QMainWindow, LoggerMixin):
             # Generate recording ID
             self.current_recording_id = self.file_manager.generate_recording_id()
             
+            # Configure audio devices
+            self._configure_audio_devices()
+            
+            # Get output file path
+            output_file = self.file_manager.get_recording_path(self.current_recording_id)
+            
+            # Start audio capture
+            if not self.audio_capture.start_recording(str(output_file)):
+                self._show_error("Recording Error", "Failed to start audio recording.")
+                return
+            
             # Create metadata
             metadata = self.file_manager.create_recording_metadata(self.current_recording_id)
             
@@ -361,6 +386,10 @@ class MainWindow(QMainWindow, LoggerMixin):
     def _stop_recording(self):
         """Stop recording"""
         try:
+            # Stop audio capture first
+            if not self.audio_capture.stop_recording():
+                self.logger.error("Failed to stop audio capture properly")
+            
             self.is_recording = False
             self.timer.stop()
             
@@ -373,11 +402,19 @@ class MainWindow(QMainWindow, LoggerMixin):
             self.app_audio_combo.setEnabled(True)
             self.mic_audio_combo.setEnabled(True)
             
-            # Update recording metadata
+            # Update recording metadata with actual duration
             duration = self._format_duration(self.recording_start_time)
+            
+            # Get file size if available
+            recording_path = self.file_manager.get_recording_path(self.current_recording_id)
+            file_size = 0
+            if recording_path.exists():
+                file_size = recording_path.stat().st_size
+            
             self.file_manager.update_metadata(
                 self.current_recording_id,
-                duration=duration
+                duration=duration,
+                file_size=file_size
             )
             
             self.recording_stopped.emit()
@@ -446,9 +483,29 @@ class MainWindow(QMainWindow, LoggerMixin):
             return
         
         metadata = item.data(Qt.ItemDataRole.UserRole)
-        self.logger.info(f"Playing recording: {metadata.recording_id}")
-        # TODO: Implement audio playback
-        self.statusBar().showMessage(f"Playing: {metadata.recording_id}", 3000)
+        recording_path = self.file_manager.get_recording_path(metadata.recording_id)
+        
+        if not recording_path.exists():
+            self._show_error("File Not Found", f"Recording file not found: {recording_path}")
+            return
+        
+        # Stop current playback if any
+        if self.audio_player.is_playing:
+            self.audio_player.stop()
+        
+        # Load and play the recording
+        if self.audio_player.load_file(recording_path):
+            if self.audio_player.play():
+                self.play_button.setText("⏸ Pause")
+                self.statusBar().showMessage(f"Playing: {metadata.recording_id}", 3000)
+                self.logger.info(f"Playing recording: {metadata.recording_id}")
+                
+                # Set up progress callback
+                self.audio_player.set_progress_callback(self._on_playback_progress)
+            else:
+                self._show_error("Playback Error", "Failed to start audio playback.")
+        else:
+            self._show_error("Load Error", "Failed to load audio file for playback.")
     
     def _transcribe_selected_recording(self):
         """Transcribe selected recording"""
@@ -538,6 +595,79 @@ class MainWindow(QMainWindow, LoggerMixin):
     def _show_error(self, title: str, message: str):
         """Show error message dialog"""
         QMessageBox.critical(self, title, message)
+    
+    def _configure_audio_devices(self):
+        """Configure audio devices based on UI selection"""
+        # Configure microphone
+        if self.mic_audio_combo.currentIndex() > 0:
+            mic_device = self.mic_audio_combo.currentData()
+            self.audio_capture.set_microphone_device(mic_device)
+        else:
+            self.audio_capture.set_microphone_device(None)
+        
+        # Configure application audio
+        if self.app_audio_combo.currentIndex() > 0:
+            app_device = self.app_audio_combo.currentData()
+            self.audio_capture.set_application_device(app_device)
+        else:
+            self.audio_capture.set_application_device(None)
+    
+    def _on_audio_level_update(self, source: str, level):
+        """Handle audio level updates from capture system"""
+        try:
+            # Update audio level display
+            if hasattr(level, 'rms') and hasattr(level, 'peak'):
+                if HAS_NUMPY:
+                    # Convert to dB scale for display
+                    rms_db = 20 * np.log10(max(level.rms, 1e-6)) if level.rms > 0 else -60
+                    peak_db = 20 * np.log10(max(level.peak, 1e-6)) if level.peak > 0 else -60
+                    
+                    # Create visual representation
+                    level_bars = self._create_level_bars(rms_db)
+                else:
+                    # Fallback without numpy
+                    import math
+                    rms_db = 20 * math.log10(max(level.rms, 1e-6)) if level.rms > 0 else -60
+                    level_bars = self._create_level_bars(rms_db)
+                
+                # Update UI on main thread
+                if source == "microphone":
+                    self.audio_levels_label.setText(f"🎤 {level_bars}")
+                elif source == "application":
+                    self.audio_levels_label.setText(f"🔊 {level_bars}")
+                else:
+                    self.audio_levels_label.setText(f"🎵 {level_bars}")
+        except Exception as e:
+            self.logger.debug(f"Error updating audio levels: {e}")
+    
+    def _create_level_bars(self, db_level: float) -> str:
+        """Create visual level bars from dB level"""
+        try:
+            # Normalize dB to 0-8 scale (assuming -60dB to 0dB range)
+            normalized = max(0, min(8, int((db_level + 60) / 7.5)))
+            
+            # Create bar representation
+            bars = "▁▂▃▄▅▆▇█"
+            full_bars = "█" * normalized
+            empty_bars = "▁" * (8 - normalized)
+            
+            return full_bars + empty_bars
+        except:
+            return "▁▁▁▁▁▁▁▁"
+    
+    def _on_playback_progress(self, position: float, duration: float):
+        """Handle playback progress updates"""
+        try:
+            # Update status bar with playback position
+            pos_str = self._format_duration(int(position))
+            dur_str = self._format_duration(int(duration))
+            self.statusBar().showMessage(f"Playing: {pos_str} / {dur_str}")
+            
+            # Reset play button when playback finishes
+            if position >= duration or not self.audio_player.is_playing:
+                self.play_button.setText("▶ Play")
+        except Exception as e:
+            self.logger.debug(f"Error updating playback progress: {e}")
     
     def closeEvent(self, event):
         """Handle window close event"""
