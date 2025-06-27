@@ -9,10 +9,10 @@ dependencies = [
     "pyqtdarktheme>=2.1.0",
     "sounddevice>=0.4.6",
     "numpy>=1.24.0",
-    # AI dependencies will be added later when Python version issues are resolved
-    # "openai-whisper>=20231117",
-    # "llama-cpp-python>=0.2.0",
-    # "pyannote.audio>=3.1.0",
+    # AI dependencies - using compatible versions
+    "faster-whisper>=1.0.0",
+    "llama-cpp-python>=0.2.0",
+    "transformers>=4.30.0",
     "pydub>=0.25.1",
     "python-docx>=1.1.0",
     "reportlab>=4.0.0",

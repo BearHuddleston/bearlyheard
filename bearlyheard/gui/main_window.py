@@ -1,6 +1,7 @@
 """Main window for BearlyHeard application"""
 
 import sys
+from datetime import datetime
 from typing import Optional
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -24,6 +25,7 @@ from ..audio.devices import AudioDeviceManager, AudioDevice
 from ..audio.capture import AudioCapture, AudioLevel
 from ..audio.player import AudioPlayer
 from .themes import ThemeManager
+from .workers import TranscriptionWorker, SummarizationWorker
 
 
 class MainWindow(QMainWindow, LoggerMixin):
@@ -48,6 +50,10 @@ class MainWindow(QMainWindow, LoggerMixin):
         self.is_recording = False
         self.recording_start_time = None
         self.current_recording_id = None
+        
+        # Worker threads
+        self.transcription_worker = None
+        self.summarization_worker = None
         
         # Timer for updating recording duration
         self.timer = QTimer()
@@ -518,9 +524,45 @@ class MainWindow(QMainWindow, LoggerMixin):
     
     def _transcribe_recording(self, recording_id: str):
         """Transcribe a recording"""
-        self.logger.info(f"Starting transcription: {recording_id}")
-        # TODO: Implement transcription
-        self.statusBar().showMessage(f"Transcribing: {recording_id}", 3000)
+        recording_path = self.file_manager.get_recording_path(recording_id)
+        
+        if not recording_path.exists():
+            self._show_error("File Not Found", f"Recording file not found: {recording_path}")
+            return
+        
+        # Check if already transcribing
+        if self.transcription_worker and self.transcription_worker.isRunning():
+            self._show_error("Transcription In Progress", "Please wait for current transcription to complete.")
+            return
+        
+        # Get model size from config
+        model_size = self.config.get("transcription.model_size", "base")
+        language = self.config.get("transcription.language")
+        
+        # Start transcription worker
+        self.transcription_worker = TranscriptionWorker(
+            str(recording_path),
+            model_size=model_size,
+            language=language
+        )
+        
+        # Connect signals
+        self.transcription_worker.progress_updated.connect(self._on_transcription_progress)
+        self.transcription_worker.transcription_completed.connect(
+            lambda result: self._on_transcription_completed(recording_id, result)
+        )
+        self.transcription_worker.transcription_failed.connect(self._on_transcription_failed)
+        
+        # Start worker
+        self.transcription_worker.start()
+        
+        # Update UI
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.status_label.setText("Transcribing...")
+        self.transcribe_button.setEnabled(False)
+        
+        self.logger.info(f"Started background transcription: {recording_id}")
     
     def _summarize_selected_recording(self):
         """Summarize selected recording"""
@@ -668,6 +710,78 @@ class MainWindow(QMainWindow, LoggerMixin):
                 self.play_button.setText("▶ Play")
         except Exception as e:
             self.logger.debug(f"Error updating playback progress: {e}")
+    
+    def _on_transcription_progress(self, progress: float):
+        """Handle transcription progress updates"""
+        try:
+            progress_percent = int(progress * 100)
+            self.progress_bar.setValue(progress_percent)
+            self.status_label.setText(f"Transcribing... {progress_percent}%")
+        except Exception as e:
+            self.logger.debug(f"Error updating transcription progress: {e}")
+    
+    def _on_transcription_completed(self, recording_id: str, result):
+        """Handle transcription completion"""
+        try:
+            # Save transcript to file
+            transcript_path = self.file_manager.get_transcript_path(recording_id)
+            
+            # Format transcript with timestamps
+            formatted_transcript = ""
+            for segment in result.segments:
+                start_time = self._format_timestamp(segment.start)
+                formatted_transcript += f"[{start_time}] {segment.text}\n"
+            
+            # Save to file
+            with open(transcript_path, 'w', encoding='utf-8') as f:
+                f.write(formatted_transcript)
+            
+            # Update metadata
+            self.file_manager.update_metadata(
+                recording_id,
+                transcription={
+                    "model": result.model_name,
+                    "language": result.language,
+                    "completed": datetime.now().isoformat(),
+                    "segments": len(result.segments)
+                }
+            )
+            
+            # Update UI
+            self.progress_bar.setVisible(False)
+            self.status_label.setText("Transcription completed")
+            self.transcribe_button.setEnabled(True)
+            self.summarize_button.setEnabled(True)  # Enable summarization
+            
+            # Show completion message
+            self.statusBar().showMessage(f"Transcription completed: {len(result.segments)} segments", 5000)
+            
+            # Refresh recordings list
+            self._refresh_recordings_list()
+            
+            self.logger.info(f"Transcription completed for {recording_id}")
+            
+        except Exception as e:
+            self.logger.error(f"Error saving transcription: {e}")
+            self._show_error("Transcription Error", f"Failed to save transcription: {e}")
+    
+    def _on_transcription_failed(self, error_message: str):
+        """Handle transcription failure"""
+        # Update UI
+        self.progress_bar.setVisible(False)
+        self.status_label.setText("Transcription failed")
+        self.transcribe_button.setEnabled(True)
+        
+        # Show error
+        self._show_error("Transcription Failed", f"Transcription failed: {error_message}")
+        
+        self.logger.error(f"Transcription failed: {error_message}")
+    
+    def _format_timestamp(self, seconds: float) -> str:
+        """Format seconds as MM:SS timestamp"""
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes:02d}:{secs:02d}"
     
     def closeEvent(self, event):
         """Handle window close event"""
