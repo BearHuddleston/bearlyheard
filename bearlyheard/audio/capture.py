@@ -4,7 +4,7 @@ import threading
 import time
 import wave
 from pathlib import Path
-from typing import Optional, Callable, List
+from typing import Optional, Callable, List, Dict, Any
 from dataclasses import dataclass
 
 try:
@@ -16,8 +16,11 @@ except (ImportError, OSError):
     np = None
     HAS_SOUNDDEVICE = False
 
+from .devices import AudioDevice, AudioDeviceManager
+from .applications import AudioApplication
+from .app_recorder import ApplicationAudioRecorder
+from .wasapi_capture import WASAPIApplicationRecorder
 from ..utils.logger import LoggerMixin
-from .devices import AudioDevice
 
 
 @dataclass
@@ -159,9 +162,11 @@ class AudioCapture(LoggerMixin):
     
     def __init__(self):
         """Initialize audio capture system"""
+        self.device_manager = AudioDeviceManager()  # Initialize device_manager
         self.microphone_recorder = None
         self.application_recorder = None
-        self.sample_rate = 44100
+        self.default_sample_rate = 44100  # Default/fallback sample rate
+        self.actual_sample_rate = 44100   # Will be updated based on devices
         self.channels = 2
         self.is_recording = False
         self.output_file = None
@@ -169,25 +174,142 @@ class AudioCapture(LoggerMixin):
         
         self.logger.info("AudioCapture initialized")
     
+    def _determine_optimal_sample_rate(self):
+        """Determine the optimal sample rate based on selected devices"""
+        sample_rates = []
+        
+        # Check microphone device sample rate
+        if self.microphone_recorder and hasattr(self.microphone_recorder, 'device') and self.microphone_recorder.device:
+            # For now, assume microphone uses default sample rate
+            # In a real implementation, we'd query the device
+            sample_rates.append(self.default_sample_rate)
+        
+        # Check application recorder sample rate
+        if self.application_recorder:
+            if hasattr(self.application_recorder, 'actual_sample_rate'):
+                sample_rates.append(self.application_recorder.actual_sample_rate)
+            else:
+                # Fallback: check if it's a WASAPI recorder with loopback devices
+                loopback_devices = self.device_manager.get_loopback_devices()
+                if loopback_devices:
+                    # Most loopback devices use 48kHz
+                    sample_rates.append(48000)
+        
+        if sample_rates:
+            # Use the highest sample rate to avoid quality loss
+            self.actual_sample_rate = max(sample_rates)
+            self.logger.info(f"Determined optimal sample rate: {self.actual_sample_rate}Hz from rates: {sample_rates}")
+        else:
+            self.actual_sample_rate = self.default_sample_rate
+            self.logger.info(f"Using default sample rate: {self.actual_sample_rate}Hz")
+    
     def set_microphone_device(self, device: Optional[AudioDevice]):
         """Set microphone device"""
         if self.is_recording:
             self.logger.warning("Cannot change device while recording")
             return
         
-        self.microphone_recorder = AudioRecorder(device, self.sample_rate, self.channels)
+        self.microphone_recorder = AudioRecorder(device, self.actual_sample_rate, self.channels)
         if device:
             self.logger.info(f"Set microphone device: {device.name}")
+        
+        # Update sample rate after setting devices
+        self._determine_optimal_sample_rate()
+    
+    def set_application(self, application: Optional[AudioApplication]):
+        """Set application audio"""
+        if self.is_recording:
+            self.logger.warning("Cannot change application while recording")
+            return
+        
+        if application:
+            # First, determine what sample rate the loopback devices use
+            loopback_devices = self.device_manager.get_loopback_devices()
+            if loopback_devices:
+                # Find the best loopback device (prioritize SteelSeries Sonar Gaming)
+                best_device = None
+                for device in loopback_devices:
+                    if "steelseries sonar" in device.name.lower() and "gaming" in device.name.lower():
+                        best_device = device
+                        break
+                
+                # Fallback to any SteelSeries Sonar device
+                if not best_device:
+                    for device in loopback_devices:
+                        if "steelseries sonar" in device.name.lower():
+                            best_device = device
+                            break
+                
+                # Final fallback to first available loopback device
+                if not best_device:
+                    best_device = loopback_devices[0]
+                
+                # Use the device's actual sample rate
+                old_sample_rate = self.actual_sample_rate
+                
+                # Try to get the device's default sample rate
+                try:
+                    import pyaudiowpatch as pyaudio
+                    pa = pyaudio.PyAudio()
+                    
+                    # Find the device index for this device
+                    device_index = None
+                    for i in range(pa.get_device_count()):
+                        device_info = pa.get_device_info_by_index(i)
+                        if device_info['name'] == best_device.name:
+                            device_index = i
+                            self.actual_sample_rate = int(device_info['defaultSampleRate'])
+                            break
+                    
+                    pa.terminate()
+                    
+                    if device_index is not None:
+                        self.logger.info(f"Using {best_device.name} at {self.actual_sample_rate}Hz")
+                    else:
+                        self.actual_sample_rate = 48000  # Fallback
+                        self.logger.warning(f"Could not find device index for {best_device.name}, using 48kHz fallback")
+                        
+                except Exception as e:
+                    self.logger.error(f"Error detecting device sample rate: {e}")
+                    self.actual_sample_rate = 48000  # Fallback
+                
+                # Update microphone recorder if sample rate changed
+                if old_sample_rate != self.actual_sample_rate and self.microphone_recorder:
+                    mic_device = self.microphone_recorder.device if hasattr(self.microphone_recorder, 'device') else None
+                    self.microphone_recorder = AudioRecorder(mic_device, self.actual_sample_rate, self.channels)
+                    self.logger.info(f"Updated microphone recorder to {self.actual_sample_rate}Hz")
+            
+            # Use WASAPI for true application-specific audio capture
+            self.application_recorder = WASAPIApplicationRecorder(application, self.actual_sample_rate, self.channels)
+            self.logger.info(f"Set application: {application.name} (using WASAPI at {self.actual_sample_rate}Hz)")
+            self.logger.info("Using Windows Audio Session API for application-specific capture")
+        else:
+            self.application_recorder = None
+            # Reset to default sample rate if no application
+            old_sample_rate = self.actual_sample_rate
+            self.actual_sample_rate = self.default_sample_rate
+            
+            # Update microphone recorder if sample rate changed
+            if old_sample_rate != self.actual_sample_rate and self.microphone_recorder:
+                mic_device = self.microphone_recorder.device if hasattr(self.microphone_recorder, 'device') else None
+                self.microphone_recorder = AudioRecorder(mic_device, self.actual_sample_rate, self.channels)
+                self.logger.info(f"Reset microphone recorder to {self.actual_sample_rate}Hz")
     
     def set_application_device(self, device: Optional[AudioDevice]):
-        """Set application audio device"""
+        """Set application audio device (backward compatibility)"""
         if self.is_recording:
             self.logger.warning("Cannot change device while recording")
             return
         
-        self.application_recorder = AudioRecorder(device, self.sample_rate, self.channels)
         if device:
+            # For device-based recording, use the original AudioRecorder
+            self.application_recorder = AudioRecorder(device, self.actual_sample_rate, self.channels)
             self.logger.info(f"Set application device: {device.name}")
+        else:
+            self.application_recorder = None
+        
+        # Update sample rate after setting devices
+        self._determine_optimal_sample_rate()
     
     def add_level_callback(self, callback: Callable[[str, AudioLevel], None]):
         """Add callback for audio level updates"""
@@ -305,7 +427,7 @@ class AudioCapture(LoggerMixin):
             with wave.open(str(self.output_file), 'wb') as wav_file:
                 wav_file.setnchannels(self.channels)
                 wav_file.setsampwidth(2)  # 16-bit
-                wav_file.setframerate(self.sample_rate)
+                wav_file.setframerate(self.actual_sample_rate)
                 
                 # Convert to 16-bit integers
                 audio_int16 = (mixed_audio * 32767).astype(np.int16)
@@ -369,6 +491,6 @@ class AudioCapture(LoggerMixin):
         # Estimate duration based on audio data
         if self.microphone_recorder and self.microphone_recorder.audio_data:
             total_frames = sum(len(chunk) for chunk in self.microphone_recorder.audio_data)
-            return total_frames / self.sample_rate
+            return total_frames / self.actual_sample_rate
         
         return 0.0

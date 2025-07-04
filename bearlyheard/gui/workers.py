@@ -116,7 +116,17 @@ class SummarizationWorker(QThread, LoggerMixin):
             
             if result:
                 self.logger.info(f"Summarization completed successfully")
-                self.summarization_completed.emit(result)
+                # Convert SummaryResult to dict for signal emission
+                result_dict = {
+                    'summary': result.summary,
+                    'action_items': result.action_items,
+                    'key_points': result.key_points,
+                    'participants': result.participants,
+                    'decisions': result.decisions,
+                    'summary_type': result.summary_type,
+                    'model_name': result.model_name
+                }
+                self.summarization_completed.emit(result_dict)
             else:
                 self.logger.error("Summarization failed: no result returned")
                 self.summarization_failed.emit("Summarization failed: no result returned")

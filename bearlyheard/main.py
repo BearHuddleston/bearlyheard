@@ -21,13 +21,13 @@ def main():
     # Load configuration
     config = Config()
     
-    # Create Qt application
+    # Create Qt application (high DPI scaling is enabled by default in Qt6)
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtGui import QGuiApplication
+    
     app = QApplication(sys.argv)
     app.setApplicationName("BearlyHeard")
     app.setOrganizationName("BearlyHeard")
-    
-    # Enable high DPI scaling
-    app.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps)
     
     # Apply theme
     theme_manager = ThemeManager()

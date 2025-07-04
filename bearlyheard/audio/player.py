@@ -16,14 +16,20 @@ except (ImportError, OSError):
     wavfile = None
     HAS_AUDIO_LIBS = False
 
+from PyQt6.QtCore import QObject, pyqtSignal
 from ..utils.logger import LoggerMixin
 
 
-class AudioPlayer(LoggerMixin):
+class AudioPlayer(QObject, LoggerMixin):
     """Simple audio player for recordings"""
+    
+    # Qt signals for thread-safe communication
+    progress_updated = pyqtSignal(float, float)  # position, duration
+    playback_finished = pyqtSignal()
     
     def __init__(self):
         """Initialize audio player"""
+        super().__init__()
         self.is_playing = False
         self.audio_data = None
         self.sample_rate = 44100
@@ -204,46 +210,41 @@ class AudioPlayer(LoggerMixin):
             if len(self.audio_data.shape) == 1:
                 # Mono
                 audio_to_play = self.audio_data[start_frame:]
+                channels = 1
             else:
                 # Stereo or multi-channel
                 audio_to_play = self.audio_data[start_frame:, :]
+                channels = audio_to_play.shape[1]
             
             if len(audio_to_play) == 0:
                 self.is_playing = False
                 return
             
-            # Play audio with progress tracking
-            chunk_size = 1024
-            chunks_played = 0
-            total_chunks = len(audio_to_play) // chunk_size + 1
+            # Set up playback state
+            self.playback_data = audio_to_play
+            self.playback_index = 0
             
+            # Play audio using sounddevice
             with sd.OutputStream(
                 samplerate=self.sample_rate,
-                channels=audio_to_play.shape[1] if len(audio_to_play.shape) > 1 else 1,
-                callback=self._audio_callback
+                channels=channels,
+                callback=self._audio_callback,
+                blocksize=1024
             ) as stream:
                 
-                for i in range(0, len(audio_to_play), chunk_size):
-                    if not self.is_playing:
-                        break
-                    
-                    chunk = audio_to_play[i:i + chunk_size]
-                    
+                # Keep playing until finished or stopped
+                while self.is_playing and self.playback_index < len(self.playback_data):
                     # Update position
-                    self.current_position = start_frame / self.sample_rate + i / self.sample_rate
+                    self.current_position = (start_frame + self.playback_index) / self.sample_rate
                     
-                    # Call progress callback
-                    if self.progress_callback:
-                        try:
-                            self.progress_callback(self.current_position, self.duration)
-                        except:
-                            pass
+                    # Emit progress signal
+                    self.progress_updated.emit(self.current_position, self.duration)
                     
-                    # Small delay to prevent overwhelming the audio system
-                    time.sleep(chunk_size / self.sample_rate)
-                    chunks_played += 1
+                    # Small delay
+                    time.sleep(0.1)
             
             self.is_playing = False
+            self.playback_finished.emit()
             
         except Exception as e:
             self.logger.error(f"Playback error: {e}")
@@ -254,6 +255,34 @@ class AudioPlayer(LoggerMixin):
         if status:
             self.logger.warning(f"Playback callback status: {status}")
         
-        # This is handled by the worker thread
-        # Just fill with silence to prevent underruns
-        outdata.fill(0)
+        if not self.is_playing or not hasattr(self, 'playback_data'):
+            outdata.fill(0)
+            return
+        
+        # Get the next chunk of audio data
+        start_idx = self.playback_index
+        end_idx = min(start_idx + frames, len(self.playback_data))
+        
+        if start_idx >= len(self.playback_data):
+            # End of audio
+            outdata.fill(0)
+            self.is_playing = False
+            return
+        
+        # Copy audio data to output
+        chunk_size = end_idx - start_idx
+        if len(self.playback_data.shape) == 1:
+            # Mono
+            outdata[:chunk_size, 0] = self.playback_data[start_idx:end_idx]
+            if outdata.shape[1] > 1:  # If output is stereo, duplicate to both channels
+                outdata[:chunk_size, 1] = self.playback_data[start_idx:end_idx]
+        else:
+            # Multi-channel
+            outdata[:chunk_size, :] = self.playback_data[start_idx:end_idx, :]
+        
+        # Fill remaining with silence if needed
+        if chunk_size < frames:
+            outdata[chunk_size:, :] = 0
+        
+        # Update playback index
+        self.playback_index = end_idx

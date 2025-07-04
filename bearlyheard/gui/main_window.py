@@ -22,10 +22,11 @@ from ..utils.logger import LoggerMixin
 from ..utils.config import Config
 from ..utils.file_manager import FileManager
 from ..audio.devices import AudioDeviceManager, AudioDevice
+from ..audio.applications import ApplicationManager, AudioApplication
 from ..audio.capture import AudioCapture, AudioLevel
 from ..audio.player import AudioPlayer
 from .themes import ThemeManager
-from .workers import TranscriptionWorker, SummarizationWorker
+from .workers import TranscriptionWorker
 
 
 class MainWindow(QMainWindow, LoggerMixin):
@@ -42,6 +43,7 @@ class MainWindow(QMainWindow, LoggerMixin):
         self.config = Config()
         self.file_manager = FileManager()
         self.audio_device_manager = AudioDeviceManager()
+        self.application_manager = ApplicationManager()
         self.audio_capture = AudioCapture()
         self.audio_player = AudioPlayer()
         self.theme_manager = ThemeManager()
@@ -53,7 +55,6 @@ class MainWindow(QMainWindow, LoggerMixin):
         
         # Worker threads
         self.transcription_worker = None
-        self.summarization_worker = None
         
         # Timer for updating recording duration
         self.timer = QTimer()
@@ -104,7 +105,7 @@ class MainWindow(QMainWindow, LoggerMixin):
         """Create audio sources selection section"""
         frame = QFrame()
         frame.setFrameStyle(QFrame.Shape.Box)
-        frame.setMaximumHeight(120)
+        frame.setMaximumHeight(150)
         
         layout = QGridLayout(frame)
         layout.setSpacing(10)
@@ -112,7 +113,7 @@ class MainWindow(QMainWindow, LoggerMixin):
         # Title
         title = QLabel("Audio Sources")
         title.setFont(QFont("Arial", 12, QFont.Weight.Bold))
-        layout.addWidget(title, 0, 0, 1, 2)
+        layout.addWidget(title, 0, 0, 1, 3)
         
         # Application audio selection
         layout.addWidget(QLabel("Application:"), 1, 0)
@@ -120,16 +121,22 @@ class MainWindow(QMainWindow, LoggerMixin):
         self.app_audio_combo.setMinimumWidth(300)
         layout.addWidget(self.app_audio_combo, 1, 1)
         
+        # Refresh button
+        refresh_button = QPushButton("Refresh Devices")
+        refresh_button.clicked.connect(self._refresh_audio_devices)
+        layout.addWidget(refresh_button, 1, 2)
+        
         # Microphone selection
         layout.addWidget(QLabel("Microphone:"), 2, 0)
         self.mic_audio_combo = QComboBox()
         self.mic_audio_combo.setMinimumWidth(300)
         layout.addWidget(self.mic_audio_combo, 2, 1)
         
-        # Refresh button
-        refresh_btn = QPushButton("Refresh Devices")
-        refresh_btn.clicked.connect(self._refresh_audio_devices)
-        layout.addWidget(refresh_btn, 1, 2)
+        # Info label
+        info_label = QLabel("Using Windows Audio Session API (WASAPI) for true application-specific audio capture. Select a running application to record only its audio.")
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("color: #888; font-size: 10px;")
+        layout.addWidget(info_label, 3, 0, 1, 3)
         
         return frame
     
@@ -205,7 +212,7 @@ class MainWindow(QMainWindow, LoggerMixin):
         buttons_layout = QHBoxLayout()
         
         self.play_button = QPushButton("▶ Play")
-        self.play_button.clicked.connect(self._play_selected_recording)
+        self.play_button.clicked.connect(self._toggle_playback)
         self.play_button.setEnabled(False)
         buttons_layout.addWidget(self.play_button)
         
@@ -282,6 +289,10 @@ class MainWindow(QMainWindow, LoggerMixin):
         
         # Theme manager
         self.theme_manager.theme_changed.connect(self._on_theme_changed)
+        
+        # Audio player signals (connect once during setup)
+        self.audio_player.progress_updated.connect(self._on_playback_progress)
+        self.audio_player.playback_finished.connect(self._on_playback_finished)
     
     def _load_audio_devices(self):
         """Load audio devices into combo boxes"""
@@ -294,10 +305,10 @@ class MainWindow(QMainWindow, LoggerMixin):
         self.mic_audio_combo.addItem("Select microphone...")
         
         try:
-            # Load loopback devices for application audio
-            loopback_devices = self.audio_device_manager.get_loopback_devices()
-            for device in loopback_devices:
-                self.app_audio_combo.addItem(device.name, device)
+            # Load running applications for application audio
+            running_applications = self.application_manager.get_audio_applications()
+            for app in running_applications:
+                self.app_audio_combo.addItem(app.name, app)
             
             # Load input devices for microphone
             input_devices = self.audio_device_manager.get_input_devices()
@@ -319,6 +330,7 @@ class MainWindow(QMainWindow, LoggerMixin):
     def _refresh_audio_devices(self):
         """Refresh audio device list"""
         self.audio_device_manager.refresh_devices()
+        self.application_manager.refresh_applications()
         self._load_audio_devices()
         self.statusBar().showMessage("Audio devices refreshed", 3000)
     
@@ -482,6 +494,14 @@ class MainWindow(QMainWindow, LoggerMixin):
         """Handle double-click on recording item"""
         self._play_selected_recording()
     
+    def _toggle_playback(self):
+        """Toggle playback"""
+        if self.audio_player.is_playing:
+            self.audio_player.pause()
+            self.play_button.setText("▶ Play")
+        else:
+            self._play_selected_recording()
+    
     def _play_selected_recording(self):
         """Play selected recording"""
         item = self.recordings_list.currentItem()
@@ -505,9 +525,6 @@ class MainWindow(QMainWindow, LoggerMixin):
                 self.play_button.setText("⏸ Pause")
                 self.statusBar().showMessage(f"Playing: {metadata.recording_id}", 3000)
                 self.logger.info(f"Playing recording: {metadata.recording_id}")
-                
-                # Set up progress callback
-                self.audio_player.set_progress_callback(self._on_playback_progress)
             else:
                 self._show_error("Playback Error", "Failed to start audio playback.")
         else:
@@ -571,9 +588,87 @@ class MainWindow(QMainWindow, LoggerMixin):
             return
         
         metadata = item.data(Qt.ItemDataRole.UserRole)
-        self.logger.info(f"Starting summarization: {metadata.recording_id}")
-        # TODO: Implement summarization
-        self.statusBar().showMessage(f"Summarizing: {metadata.recording_id}", 3000)
+        recording_id = metadata.recording_id
+        
+        # Check if transcript exists
+        transcript_path = self.file_manager.get_transcript_path(recording_id)
+        if not transcript_path.exists():
+            self._show_error("No Transcript", "Please transcribe the recording first before summarizing.")
+            return
+        
+        # Get summary type from config (or default to executive)
+        summary_type = self.config.get("summarization.type", "executive")
+        
+        # Use external process to avoid Qt6 + llama-cpp-python conflicts
+        import subprocess
+        import tempfile
+        import json
+        from pathlib import Path
+        
+        # Update UI to show progress
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.status_label.setText("Summarizing...")
+        self.summarize_button.setEnabled(False)
+        
+        self.logger.info(f"Starting external process summarization: {recording_id}")
+        
+        try:
+            # Create temporary output file
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as temp_file:
+                temp_output = Path(temp_file.name)
+            
+            # Run external summarization process
+            external_script = Path(__file__).parent.parent.parent / "summarize_external.py"
+            cmd = [
+                sys.executable, str(external_script),
+                str(transcript_path),
+                summary_type,
+                str(temp_output)
+            ]
+            
+            self.progress_bar.setValue(25)
+            self.status_label.setText("Running AI summarization...")
+            
+            # Process events to update UI
+            from PyQt6.QtWidgets import QApplication
+            QApplication.processEvents()
+            
+            # Run the external process
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)  # 5 minute timeout
+            
+            self.progress_bar.setValue(75)
+            
+            if result.returncode == 0:
+                # Read result
+                if temp_output.exists():
+                    result_data = json.loads(temp_output.read_text(encoding='utf-8'))
+                    temp_output.unlink()  # Clean up
+                    
+                    if result_data.get('success', False):
+                        self._on_summarization_completed(recording_id, result_data)
+                    else:
+                        self._on_summarization_failed(result_data.get('error', 'Unknown error'))
+                else:
+                    self._on_summarization_failed("Output file not found")
+            else:
+                error_msg = f"External process failed: {result.stderr}"
+                self.logger.error(error_msg)
+                self._on_summarization_failed(error_msg)
+                
+        except subprocess.TimeoutExpired:
+            self._on_summarization_failed("Summarization timed out (5 minutes)")
+        except Exception as e:
+            error_msg = f"Summarization error: {str(e)}"
+            self.logger.error(error_msg)
+            self._on_summarization_failed(error_msg)
+        finally:
+            # Clean up temp file if it exists
+            if 'temp_output' in locals() and temp_output.exists():
+                try:
+                    temp_output.unlink()
+                except:
+                    pass
     
     def _delete_selected_recording(self):
         """Delete selected recording"""
@@ -649,10 +744,10 @@ class MainWindow(QMainWindow, LoggerMixin):
         
         # Configure application audio
         if self.app_audio_combo.currentIndex() > 0:
-            app_device = self.app_audio_combo.currentData()
-            self.audio_capture.set_application_device(app_device)
+            app = self.app_audio_combo.currentData()
+            self.audio_capture.set_application(app)
         else:
-            self.audio_capture.set_application_device(None)
+            self.audio_capture.set_application(None)
     
     def _on_audio_level_update(self, source: str, level):
         """Handle audio level updates from capture system"""
@@ -710,6 +805,10 @@ class MainWindow(QMainWindow, LoggerMixin):
                 self.play_button.setText("▶ Play")
         except Exception as e:
             self.logger.debug(f"Error updating playback progress: {e}")
+    
+    def _on_playback_finished(self):
+        """Handle playback finished"""
+        self.play_button.setText("▶ Play")
     
     def _on_transcription_progress(self, progress: float):
         """Handle transcription progress updates"""
@@ -782,6 +881,99 @@ class MainWindow(QMainWindow, LoggerMixin):
         minutes = int(seconds // 60)
         secs = int(seconds % 60)
         return f"{minutes:02d}:{secs:02d}"
+    
+    def _on_summarization_progress(self, progress: float):
+        """Handle summarization progress updates"""
+        try:
+            progress_percent = int(progress * 100)
+            self.progress_bar.setValue(progress_percent)
+            self.status_label.setText(f"Summarizing... {progress_percent}%")
+        except Exception as e:
+            self.logger.debug(f"Error updating summarization progress: {e}")
+    
+    def _on_summarization_completed(self, recording_id: str, result):
+        """Handle summarization completion"""
+        try:
+            # Save summary to file
+            summary_path = self.file_manager.get_summary_path(recording_id)
+            
+            # Format summary
+            formatted_summary = f"""# Meeting Summary - {recording_id}
+
+## Executive Summary
+{result['summary']}
+
+## Key Points
+"""
+            for point in result['key_points']:
+                formatted_summary += f"- {point}\n"
+            
+            formatted_summary += f"""
+## Action Items
+"""
+            for item in result['action_items']:
+                formatted_summary += f"- {item}\n"
+            
+            formatted_summary += f"""
+## Participants
+{', '.join(result['participants'])}
+
+## Decisions
+"""
+            for decision in result['decisions']:
+                formatted_summary += f"- {decision}\n"
+            
+            formatted_summary += f"""
+---
+Generated by: {result['model_name']}
+Summary Type: {result['summary_type']}
+Generated on: {datetime.now().isoformat()}
+"""
+            
+            # Save to file
+            with open(summary_path, 'w', encoding='utf-8') as f:
+                f.write(formatted_summary)
+            
+            # Update metadata
+            self.file_manager.update_metadata(
+                recording_id,
+                summarization={
+                    "model": result['model_name'],
+                    "type": result['summary_type'],
+                    "completed": datetime.now().isoformat(),
+                    "key_points": len(result['key_points']),
+                    "action_items": len(result['action_items'])
+                }
+            )
+            
+            # Update UI
+            self.progress_bar.setVisible(False)
+            self.status_label.setText("Summarization completed")
+            self.summarize_button.setEnabled(True)
+            
+            # Show completion message
+            self.statusBar().showMessage(f"Summarization completed: {len(result['key_points'])} key points, {len(result['action_items'])} action items", 5000)
+            
+            # Refresh recordings list
+            self._refresh_recordings_list()
+            
+            self.logger.info(f"Summarization completed for {recording_id}")
+            
+        except Exception as e:
+            self.logger.error(f"Error saving summarization: {e}")
+            self._show_error("Summarization Error", f"Failed to save summarization: {e}")
+    
+    def _on_summarization_failed(self, error_message: str):
+        """Handle summarization failure"""
+        # Update UI
+        self.progress_bar.setVisible(False)
+        self.status_label.setText("Summarization failed")
+        self.summarize_button.setEnabled(True)
+        
+        # Show error
+        self._show_error("Summarization Failed", f"Summarization failed: {error_message}")
+        
+        self.logger.error(f"Summarization failed: {error_message}")
     
     def closeEvent(self, event):
         """Handle window close event"""

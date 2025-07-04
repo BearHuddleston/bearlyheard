@@ -3,6 +3,7 @@
 import re
 from typing import Optional, Dict, Any, List, Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 try:
     from llama_cpp import Llama
@@ -36,7 +37,7 @@ class Summarizer(LoggerMixin):
             model_path: Path to GGUF model file
             n_ctx: Context window size
         """
-        self.model_path = model_path
+        self.model_path = model_path or self._find_default_model()
         self.n_ctx = n_ctx
         self.model = None
         self.is_loaded = False
@@ -46,6 +47,37 @@ class Summarizer(LoggerMixin):
             self.logger.warning("llama-cpp-python not available, summarization limited")
         else:
             self.logger.info("Summarizer initialized with llama.cpp")
+            if self.model_path:
+                self.logger.info(f"Model path: {self.model_path}")
+            else:
+                self.logger.warning("No model found. Download a GGUF model to enable AI summarization.")
+    
+    def _find_default_model(self) -> Optional[str]:
+        """Find a default model in the models directory"""
+        
+        # Get models directory relative to this file
+        models_dir = Path(__file__).parent.parent.parent / "models"
+        
+        if not models_dir.exists():
+            return None
+        
+        # Look for models in order of preference (most compatible first)
+        model_patterns = [
+            "**/tinyllama*.gguf",      # TinyLlama - most compatible
+            "**/qwen2.5*3b*.gguf",     # Qwen2.5-3B
+            "**/qwen3*4b*.gguf",       # Qwen3-4B 
+            "**/qwen*.gguf",           # Any Qwen model
+            "**/*llama*.gguf",         # Any Llama model
+        ]
+        
+        for pattern in model_patterns:
+            matches = list(models_dir.glob(pattern))
+            if matches:
+                model_path = str(matches[0])
+                self.logger.info(f"Found model: {model_path}")
+                return model_path
+        
+        return None
     
     def load_model(self, model_path: Optional[str] = None) -> bool:
         """
@@ -71,15 +103,36 @@ class Summarizer(LoggerMixin):
             self.logger.error("No model path specified")
             return False
         
+        # Validate model file exists and is readable
+        model_file = Path(self.model_path)
+        if not model_file.exists():
+            self.logger.error(f"Model file does not exist: {self.model_path}")
+            return False
+        
+        if model_file.stat().st_size < 1024:  # Less than 1KB is definitely wrong
+            self.logger.error(f"Model file too small: {model_file.stat().st_size} bytes")
+            return False
+        
         try:
             self.logger.info(f"Loading LLM model: {self.model_path}")
             
+            # Use conservative settings to avoid memory issues
             self.model = Llama(
                 model_path=str(self.model_path),
-                n_ctx=self.n_ctx,
-                n_threads=4,
-                verbose=False
+                n_ctx=512,  # Very small context like test script
+                n_threads=1,  # Single thread like test script
+                n_batch=128,  # Small batch like test script
+                verbose=True,  # Enable verbose like test script
+                use_mmap=True,  # Use memory mapping
+                use_mlock=False,  # Don't lock memory
+                n_gpu_layers=0,  # Force CPU-only to avoid GPU issues
+                seed=42  # Fixed seed for reproducibility
             )
+            
+            # Test the model with a simple prompt
+            test_response = self.model("Hello", max_tokens=5, temperature=0.1)
+            if not test_response or 'choices' not in test_response:
+                raise Exception("Model test failed - no valid response")
             
             self.is_loaded = True
             self.logger.info(f"LLM model loaded successfully")
@@ -87,6 +140,13 @@ class Summarizer(LoggerMixin):
             
         except Exception as e:
             self.logger.error(f"Failed to load LLM model: {e}")
+            # Clean up any partial model
+            if hasattr(self, 'model') and self.model:
+                try:
+                    del self.model
+                except:
+                    pass
+                self.model = None
             return False
     
     def set_progress_callback(self, callback: Callable[[float], None]):
@@ -114,8 +174,19 @@ class Summarizer(LoggerMixin):
             self.logger.error("Cannot summarize empty text")
             return None
         
-        if not HAS_LLAMA or not self.is_loaded:
-            self.logger.warning("LLM not available, generating rule-based summary")
+        # Try to load model if we have a path but model isn't loaded
+        if not HAS_LLAMA:
+            self.logger.warning("llama-cpp-python not available, generating rule-based summary")
+            return self._create_rule_based_summary(text, summary_type)
+        
+        if not self.is_loaded and self.model_path:
+            self.logger.info("Model not loaded, attempting to load...")
+            if not self.load_model():
+                self.logger.warning("Failed to load model, generating rule-based summary")
+                return self._create_rule_based_summary(text, summary_type)
+        
+        if not self.is_loaded:
+            self.logger.warning("No model available, generating rule-based summary")
             return self._create_rule_based_summary(text, summary_type)
         
         try:
@@ -161,97 +232,84 @@ class Summarizer(LoggerMixin):
     def _create_prompt(self, text: str, summary_type: str) -> str:
         """Create appropriate prompt based on summary type"""
         
-        base_context = """You are an expert meeting assistant. Analyze the following meeting transcript and provide a comprehensive summary."""
-        
         if summary_type == "executive":
-            prompt = f"""{base_context}
+            prompt = f"""You are an expert meeting assistant. Analyze meeting transcripts and provide comprehensive, structured summaries.
+
+Please analyze this meeting transcript and provide an executive summary:
 
 TRANSCRIPT:
 {text}
 
-Please provide an executive summary in the following format:
+Provide your response in this exact format:
 
-EXECUTIVE SUMMARY:
-[Brief overview of the meeting in 2-3 sentences]
+## EXECUTIVE SUMMARY
+[Brief 2-3 sentence overview of the meeting's main purpose and outcomes]
 
-KEY DECISIONS:
-- [Decision 1]
-- [Decision 2]
+## KEY DECISIONS
+- [List each decision made during the meeting]
 
-ACTION ITEMS:
-- [Action item 1 - Assigned to: Person]
-- [Action item 2 - Assigned to: Person]
+## ACTION ITEMS  
+- [List action items with responsible person if mentioned]
 
-NEXT STEPS:
-- [Next step 1]
-- [Next step 2]
+## KEY POINTS
+- [List 3-5 most important discussion points]
 
-PARTICIPANTS:
-- [Participant 1]
-- [Participant 2]
+## PARTICIPANTS
+[List participants mentioned in the transcript]"""
 
-</summary>"""
-        
         elif summary_type == "detailed":
-            prompt = f"""{base_context}
+            prompt = f"""You are an expert meeting assistant. Analyze meeting transcripts and provide comprehensive, structured summaries.
+
+Please analyze this meeting transcript and provide a detailed summary:
 
 TRANSCRIPT:
 {text}
 
-Please provide a detailed summary in the following format:
+Provide your response in this exact format:
 
-MEETING OVERVIEW:
-[Detailed description of the meeting purpose and outcomes]
+## DETAILED SUMMARY
+[Comprehensive overview of the meeting covering all major topics discussed]
 
-MAIN TOPICS DISCUSSED:
-1. [Topic 1]
-   - [Key points]
-   - [Decisions made]
+## DISCUSSION TOPICS
+- [Topic 1: Brief description]
+- [Topic 2: Brief description]
 
-2. [Topic 2]
-   - [Key points]
-   - [Decisions made]
-
-ACTION ITEMS:
-- [Action item 1 - Assigned to: Person - Due: Date]
-- [Action item 2 - Assigned to: Person - Due: Date]
-
-DECISIONS MADE:
+## DECISIONS MADE
 - [Decision 1 with context]
 - [Decision 2 with context]
 
-FOLLOW-UP REQUIRED:
-- [Follow-up item 1]
-- [Follow-up item 2]
+## ACTION ITEMS
+- [Action item with owner and deadline if mentioned]
 
-</summary>"""
-        
+## NEXT STEPS
+- [Follow-up actions or next meeting plans]
+
+## PARTICIPANTS
+[List all participants and their roles if mentioned]"""
+
         elif summary_type == "action_items":
-            prompt = f"""{base_context}
+            prompt = f"""You are an expert meeting assistant. Analyze meeting transcripts and provide comprehensive, structured summaries.
+
+Please analyze this meeting transcript and extract all action items:
 
 TRANSCRIPT:
 {text}
 
-Focus specifically on extracting action items and commitments. Format as follows:
+Provide your response in this exact format:
 
-ACTION ITEMS:
-- [Action item 1 - Assigned to: Person - Due date: Date - Priority: High/Medium/Low]
-- [Action item 2 - Assigned to: Person - Due date: Date - Priority: High/Medium/Low]
+## ACTION ITEMS
+- [Action item 1 - Owner: Name - Due: Date if mentioned]
+- [Action item 2 - Owner: Name - Due: Date if mentioned]
 
-COMMITMENTS MADE:
-- [Commitment 1 - Person - Timeline]
-- [Commitment 2 - Person - Timeline]
+## DECISIONS REQUIRING FOLLOW-UP
+- [Decision 1 and required actions]
 
-DEADLINES MENTIONED:
-- [Deadline 1 - Date - Description]
-- [Deadline 2 - Date - Description]
+## PENDING ITEMS
+- [Items that need resolution in future meetings]
 
-FOLLOW-UP MEETINGS:
-- [Meeting 1 - Date - Purpose]
-- [Meeting 2 - Date - Purpose]
+## PARTICIPANTS
+[List participants mentioned]"""
 
-</summary>"""
-        
         else:
             # Default to executive summary
             return self._create_prompt(text, "executive")
@@ -262,7 +320,7 @@ FOLLOW-UP MEETINGS:
         """Parse LLM response into structured summary"""
         
         # Extract different sections using regex
-        summary = self._extract_section(response, ["EXECUTIVE SUMMARY:", "MEETING OVERVIEW:", "SUMMARY:"])
+        summary = self._extract_section(response, ["EXECUTIVE SUMMARY:", "DETAILED SUMMARY:", "SUMMARY:"])
         action_items = self._extract_list_items(response, ["ACTION ITEMS:", "ACTIONS:"])
         key_points = self._extract_list_items(response, ["KEY DECISIONS:", "MAIN TOPICS:", "KEY POINTS:"])
         participants = self._extract_list_items(response, ["PARTICIPANTS:", "ATTENDEES:"])

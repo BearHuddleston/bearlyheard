@@ -67,24 +67,45 @@ class Transcriber(LoggerMixin):
             return False
         
         if self.is_loaded:
+            self.logger.debug("Model already loaded")
             return True
         
         try:
-            self.logger.info(f"Loading Whisper model: {self.model_size}")
+            self.logger.info(f"Loading Whisper model: {self.model_size} on {self.device}")
             
             # Load model with CPU optimization
+            compute_type = "int8" if self.device == "cpu" else "float16"
+            self.logger.debug(f"Using compute_type: {compute_type}")
+            
             self.model = WhisperModel(
                 self.model_size,
                 device=self.device,
-                compute_type="int8" if self.device == "cpu" else "float16"
+                compute_type=compute_type
             )
             
             self.is_loaded = True
             self.logger.info(f"Whisper model {self.model_size} loaded successfully")
+            
+            # Test the model with a simple call to ensure it's working
+            try:
+                # This will help catch any issues with the model after loading
+                self.logger.debug("Testing model functionality...")
+                # We don't actually call transcribe here, just verify the model object is valid
+                if hasattr(self.model, 'transcribe'):
+                    self.logger.debug("Model appears to be functional")
+                else:
+                    self.logger.warning("Model loaded but transcribe method not found")
+            except Exception as test_e:
+                self.logger.warning(f"Model loaded but test failed: {test_e}")
+            
             return True
             
         except Exception as e:
-            self.logger.error(f"Failed to load Whisper model: {e}")
+            self.logger.error(f"Failed to load Whisper model {self.model_size}: {type(e).__name__}: {e}")
+            import traceback
+            self.logger.debug(f"Model loading error traceback: {traceback.format_exc()}")
+            self.is_loaded = False
+            self.model = None
             return False
     
     def set_progress_callback(self, callback: Callable[[float], None]):
@@ -117,35 +138,68 @@ class Transcriber(LoggerMixin):
             self.logger.error(f"Audio file not found: {audio_file}")
             return None
         
+        # Check if audio file is empty or too small
+        file_size = audio_path.stat().st_size
+        if file_size < 1024:  # Less than 1KB
+            self.logger.error(f"Audio file too small ({file_size} bytes): {audio_file}")
+            return None
+        
         # Load model if not already loaded
         if not self.load_model():
+            self.logger.error("Failed to load Whisper model")
             return None
         
         try:
-            self.logger.info(f"Starting transcription of {audio_file}")
+            self.logger.info(f"Starting transcription of {audio_file} (size: {file_size} bytes)")
             
             # Call progress callback for start
             if self.progress_callback:
                 self.progress_callback(0.0)
             
             # Transcribe audio
-            segments, info = self.model.transcribe(
-                str(audio_path),
-                language=language,
-                task=task,
-                beam_size=5,
-                best_of=5,
-                temperature=0.0,
-                condition_on_previous_text=False,
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500)
-            )
+            self.logger.debug("Calling Whisper model.transcribe()")
+            
+            # Try with VAD filter first, fallback to no VAD if it fails
+            transcribe_params = {
+                "language": language,
+                "task": task,
+                "beam_size": 5,
+                "best_of": 5,
+                "temperature": 0.0,
+                "condition_on_previous_text": False,
+            }
+            
+            try:
+                # First attempt with VAD filter
+                segments, info = self.model.transcribe(
+                    str(audio_path),
+                    vad_filter=True,
+                    vad_parameters=dict(min_silence_duration_ms=500),
+                    **transcribe_params
+                )
+                self.logger.debug("Transcription completed with VAD filter")
+            except RuntimeError as e:
+                if "VAD filter" in str(e) or "onnxruntime" in str(e):
+                    self.logger.warning(f"VAD filter failed ({e}), retrying without VAD filter")
+                    # Retry without VAD filter
+                    segments, info = self.model.transcribe(
+                        str(audio_path),
+                        vad_filter=False,
+                        **transcribe_params
+                    )
+                    self.logger.debug("Transcription completed without VAD filter")
+                else:
+                    raise  # Re-raise if it's a different RuntimeError
+            
+            self.logger.debug(f"Whisper returned info: language={info.language}, duration={getattr(info, 'duration', 'unknown')}")
             
             # Process segments
             transcription_segments = []
             full_text = ""
+            segment_count = 0
             
             for i, segment in enumerate(segments):
+                segment_count += 1
                 # Call progress callback
                 if self.progress_callback:
                     progress = min(1.0, (i + 1) / 100)  # Estimate progress
@@ -160,10 +214,26 @@ class Transcriber(LoggerMixin):
                 
                 transcription_segments.append(seg)
                 full_text += seg.text + " "
+                
+                # Log first few segments for debugging
+                if i < 3:
+                    self.logger.debug(f"Segment {i}: [{seg.start:.2f}-{seg.end:.2f}] '{seg.text}'")
             
             # Final progress update
             if self.progress_callback:
                 self.progress_callback(1.0)
+            
+            # Check if we got any segments
+            if not transcription_segments:
+                self.logger.warning(f"No transcription segments found for {audio_file}. Audio might be silent or too short.")
+                # Return empty result instead of None
+                return TranscriptionResult(
+                    text="[No speech detected]",
+                    segments=[],
+                    language=info.language if info else "unknown",
+                    duration=0.0,
+                    model_name=f"whisper-{self.model_size}"
+                )
             
             # Calculate duration
             duration = transcription_segments[-1].end if transcription_segments else 0.0
@@ -182,7 +252,9 @@ class Transcriber(LoggerMixin):
             return result
             
         except Exception as e:
-            self.logger.error(f"Failed to transcribe {audio_file}: {e}")
+            self.logger.error(f"Failed to transcribe {audio_file}: {type(e).__name__}: {e}")
+            import traceback
+            self.logger.debug(f"Transcription error traceback: {traceback.format_exc()}")
             return None
     
     def transcribe_with_timestamps(
